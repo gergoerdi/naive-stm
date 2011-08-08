@@ -2,6 +2,7 @@
 {-# LANGUAGE ExistentialQuantification #-}
 module STM ( STM, atomically
            , TVar, newTVar, readTVar, writeTVar
+           , retry, orElse
            , newTVarIO, readTVarIO
            ) where
 
@@ -9,14 +10,15 @@ import Data.IORef
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Control.Monad.State
+import Control.Monad.Maybe
 import Control.Concurrent.QSem
 import Control.Concurrent.MVar
 
 import System.IO.Unsafe (unsafePerformIO)
 import Unsafe.Coerce (unsafeCoerce)
 
-newtype STM α = STM { runSTM :: StateT Log IO α }
-              deriving Monad
+newtype STM α = STM { runSTM :: StateT Log (MaybeT IO) α }
+              deriving (Monad, MonadPlus)
 
 newtype ID = ID Int deriving (Eq, Ord, Enum)
 data TVar α = TVar ID (IORef (IORef α))
@@ -47,7 +49,11 @@ newTVar x = STM $ liftIO $ do
   return $ TVar id refref
 
 newTVarIO :: α -> IO (TVar α)
-newTVarIO x = evalStateT (runSTM $ newTVar x) (error "newTVar tried accessing the STM state")
+newTVarIO x = do
+  mx <- runMaybeT $ evalStateT (runSTM $ newTVar x) (error "newTVar tried accessing the STM state")
+  case mx of
+    Just x -> return x
+    Nothing -> error "Internal error: newTVar called retry??"
 
 readTVar :: TVar α -> STM α
 readTVar tvar@(TVar id refref) = STM $ do
@@ -79,12 +85,21 @@ writeTVar tvar@(TVar id _) x = STM $ do
 
 atomically :: STM α -> IO α
 atomically transaction = do
-  (x, log) <- runStateT (runSTM transaction) (Log Map.empty Map.empty)
-  lock
-  valid <- tryCommit log
-  unlock
-  if valid then putStrLn "Valid" >> return x else putStrLn "Invalid" >> atomically transaction
+  mres <- runMaybeT $ runStateT (runSTM transaction) (Log Map.empty Map.empty)
+  case mres of
+    Nothing -> atomically transaction
+    Just (x, log) -> do
+      lock
+      valid <- tryCommit log
+      unlock
+      if valid then return x else atomically transaction
 
+retry :: STM α
+retry = mzero
+
+orElse :: STM α -> STM α -> STM α          
+orElse = mplus
+          
 tryCommit :: Log -> IO Bool
 tryCommit log = do
   valid <- isValid log
